@@ -1,0 +1,813 @@
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1.  Test showing prioritization and signals interrupting each other
+2.  syssighandler test case
+3.  syskill test case
+4.  syssigwait test case
+5.  sysopen with invalid arguments
+6.  syswrite with invalid file descriptor
+7.  sysioctl test for invalid commands
+8.  sysread when there are more characters buffered in kernel than the read
+    requests
+--------------------------------------------------------------------------------
+Two test cases for scenarios not covered here or in the test program:
+--------------------------------------------------------------------------------
+9.  Blocked processes unblocked by a signal return with the correct value
+10. Return value of sysread is number of bytes read
+--------------------------------------------------------------------------------
+
+
+1. Test showing prioritization and signals interrupting each other
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that the kernel can properly handle the case when higher
+priority signals interrupt lower priority signal handlers.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for signal.c, which can
+be found at signaltest.c. Note that this test suite assumes that pre-emption is
+disabled.
+
+/*------------------------------------------------------------------------------
+ * Tests prioritization of signal handling when signals interrupt each other.
+ *------------------------------------------------------------------------------
+ */
+static void signal_priority_interrupt_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    g_signal_fired = 0;
+    if (debug) kprintf("Setting up signal handlers...\n");
+
+    signal_handler_funcptr oldHandler;
+
+    int res = syssighandler(LOW_PRI_SIGNAL, &low_pri_interrupt_sighandler,
+    &oldHandler);
+    assert_equal(res, 0);
+
+    res = syssighandler(HIGH_PRI_SIGNAL, &high_pri_sighandler, &oldHandler);
+    assert_equal(res, 0);
+
+    if (debug) kprintf("Starts sending signals...\n");
+
+    // Send a low priority signal to itself
+    int pid = sysgetpid();
+    res = syskill(pid, LOW_PRI_SIGNAL);
+    assert_equal(res, 0);
+    if (debug) kprintf("%s sends signal %d\n", __func__, LOW_PRI_SIGNAL);
+
+    // Yield so that this process can execute its signal handler when it is
+    // scheduled to run next time
+    sysyield();
+
+    assert(g_signal_fired == LOW_PRI_SIGNAL, "signal_priority_interrupt_test
+    expects the last signal handled is LOW_PRI_SIGNAL");
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+/*------------------------------------------------------------------------------
+ * A low priority signal handler that will send a high priority signal to
+ * itself.
+ *------------------------------------------------------------------------------
+ */
+static void low_pri_interrupt_sighandler(void *arg) {
+    kprintf("low_pri_interrupt_sighandler starts\n");
+
+    int pid = sysgetpid();
+    if (debug) kprintf("%s sends signal %d\n", __func__, HIGH_PRI_SIGNAL);
+    // We expect that high_pri_sighandler will execute after sending this signal
+    int res = syskill(pid, HIGH_PRI_SIGNAL);
+    // Yield while low priority signal handler is running with pending high
+    // priority signal
+    sysyield(res);
+    assert_equal(res, 0);
+
+    g_signal_fired = LOW_PRI_SIGNAL;
+    assert(g_signal_fired == LOW_PRI_SIGNAL, "low_pri_interrupt_sighandler");
+}
+
+/*------------------------------------------------------------------------------
+ * A high priority signal handler.
+ *------------------------------------------------------------------------------
+ */
+static void high_pri_sighandler(void *arg) {
+    kprintf("Signal %d handler starts\n", HIGH_PRI_SIGNAL);
+    g_signal_fired = HIGH_PRI_SIGNAL;
+    assert(g_signal_fired == HIGH_PRI_SIGNAL, "high_pri_sighandler");
+}
+
+This test sets up a signal handler for signal 1 and signal 30, and sends signal
+1 to itself. It then yields so that on the next context switch into the test
+process, the signal 1's signal handler will run. Signal 1's signal handler then
+runs and sends signal 30 to itself, and yields, so that on the next context
+switch, the high priority signal handler will pre-empt the lower priority
+handler and run.
+
+***How the Output Demonstrates What is Being Tested***
+The output looks like:
+
+Running signal_priority_interrupt_test
+Setting up signal handlers...
+Starts sending signals...
+signal_priority_interrupt_test sends signal 1
+low_pri_interrupt_sighandler starts
+low_pri_interrupt_sighandler sends signal 30
+Signal 30 handler starts
+low_pri_interrupt_sighandler resumes
+Finished signal_priority_interrupt_test
+
+The output shows that the higher priority signal handler pre-empts the
+lower priority handler, which resumes after the higher priority handler
+finishes.
+
+2. syssighandler test case
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that syssighandler returns the correct values on both
+success and error cases.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for signal.c, which can
+be found at signaltest.c. Note that this test suite assumes that pre-emption is
+disabled.
+
+/*------------------------------------------------------------------------------
+ * Tests syssighandler.
+ *------------------------------------------------------------------------------
+ */
+static void syssighandler_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    signal_handler_funcptr oldHandler = NULL;
+    // Error case
+    if (debug) sysputs("Testing error cases\n");
+    assert_equal(syssighandler(-1, &low_pri_sighandler, &oldHandler), -1);
+    assert_equal(syssighandler(32, &low_pri_sighandler, &oldHandler), -1);
+    assert_equal(syssighandler(31, &low_pri_sighandler, &oldHandler), -1);
+    assert_equal(syssighandler(0, (signal_handler_funcptr) - 1, &oldHandler),
+    -2);
+    assert_equal(syssighandler(0, (signal_handler_funcptr) HOLESTART,
+    &oldHandler), -2);
+    assert_equal(syssighandler(0, &low_pri_sighandler, NULL), -3);
+    assert_equal(syssighandler(0, &low_pri_sighandler,
+    (signal_handler_funcptr *) HOLESTART), -3);
+
+    if (debug) sysputs("Testing normal cases\n");
+    // To avoid interference between different tests, the signal number 13 is
+    // chosen such that no other tests will use that signal
+    assert_equal(syssighandler(13, &low_pri_sighandler, &oldHandler), 0);
+    assert_equal(syssighandler(13, &high_pri_sighandler, &oldHandler), 0);
+    assert(oldHandler == low_pri_sighandler, "Address of the old handler is not
+    expected");
+    assert_equal(syssighandler(0, NULL, &oldHandler), 0);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+To test the error cases of syssighandler, this test calls syssighandler with
+invalid signal numbers -1, 32, and 31, and asserts that the return value is -1.
+It then calls syssighandler with invalid values for new_handler and old_handler,
+and asserts that the return value is -2 and -3, respectively.
+
+To test the success cases of syssignhandler, this test validates that a signal
+handler can be registered successfully for signal 13, and that the old_handler
+is set correctly. It also tests that a signal can be marked as ignored.
+
+***How the Output Demonstrates What is Being Tested***
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running syssighandler_test
+Testing error cases
+Testing normal cases
+Finished syssighandler_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+3. syskill test case
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that syskill returns the correct values on both success and
+error cases.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for signal.c, which can
+be found at signaltest.c. Note that this test suite assumes that pre-emption is
+disabled.
+
+#define ERR_TARGET_NOT_EXIST -514
+#define ERR_INVALID_SIGNAL_NUMBER -583
+
+#define HIGH_PRI_SIGNAL 30
+
+static unsigned int g_sender_pid = 0;
+
+/*------------------------------------------------------------------------------
+ * Tests syskill.
+ *------------------------------------------------------------------------------
+ */
+static void syskill_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+    PID_t mypid = sysgetpid();
+
+    // Error cases
+    assert_equal(syskill(999, 31), ERR_TARGET_NOT_EXIST);
+    // PID is >= 1
+    assert_equal(syskill(mypid, -1), ERR_INVALID_SIGNAL_NUMBER);
+    assert_equal(syskill(mypid, 32), ERR_INVALID_SIGNAL_NUMBER);
+
+    // Success case
+    PID_t pid = syscreate(&test_process, PROCESS_STACK_SIZE);
+
+    // Yield to test_process so that it can set up signal handler
+    sysyield();
+
+    assert_equal(syskill(pid, 0), 0);
+    assert_equal(syskill(pid, HIGH_PRI_SIGNAL), 0);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+/*------------------------------------------------------------------------------
+ * A test process used by syskill_test.
+ *------------------------------------------------------------------------------
+ */
+static void test_process(void) {
+    if (debug) kprintf("%s starts running\n", __func__);
+
+    signal_handler_funcptr oldHandler = NULL;
+    // Register a signal handler
+    assert_equal(syssighandler(HIGH_PRI_SIGNAL, &high_pri_sighandler,
+    &oldHandler), 0);
+
+    sysyield();
+
+    assert(g_signal_fired == HIGH_PRI_SIGNAL, "Received signal is not
+    expected");
+
+    // Check syscalls work correctly after signal handling
+    sysstop();
+    assert(0, "test_process is still running after sysstop()");
+}
+
+/*------------------------------------------------------------------------------
+ * A high priority signal handler.
+ *------------------------------------------------------------------------------
+ */
+static void high_pri_sighandler(void *arg) {
+    kprintf("Signal %d handler starts\n", HIGH_PRI_SIGNAL);
+    g_signal_fired = HIGH_PRI_SIGNAL;
+    assert(g_signal_fired == HIGH_PRI_SIGNAL, "high_pri_sighandler");
+}
+
+To test the error cases of syskill, this test calls syskill with a PID of a
+process that does not exist and asserts that the return value is -514. It then
+calls syskill with a valid PID (the PID of the test process) and invalid signal
+numbers and asserts that the return value is -583.
+
+To test the success cases of syskill, this test creates a new process
+(test_process) and yields to it so it can set up a signal handler for signal 30.
+test_process then yields control back to the test process, which sends signal 0
+to test_process, which should return 0 as test_process has not set up a handler
+for signal 0. It then sends signal 30 to test_process, which triggers its
+handler, which sets g_signal_fired to 30. test_process then asserts that the
+value of g_signal_fired is 30, ensuring that the handler was run.
+
+***How the Output Demonstrates What is Being Tested***
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running syskill_test
+test_process starts running
+Signal 30 handler starts
+Finished syskill_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+4. syswait test case
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that syswait returns the correct values on both success and
+error cases.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for signal.c, which can
+be found at signaltest.c. Note that this test suite assumes that pre-emption is
+disabled.
+
+/*------------------------------------------------------------------------------
+ * Tests syswait.
+ *------------------------------------------------------------------------------
+ */
+static void syswait_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    // Error case
+    // Returns -1 if the process to be waited for does not exist
+    assert_equal(syswait(999), -1);
+    assert_equal(syswait(0), -1);
+
+    // Success case
+    PID_t pid = syscreate(&dummy_process, PROCESS_STACK_SIZE);
+    assert_equal(syswait(pid), 0);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+To test the error cases of syswait, this test calls syswait with a process that
+does not exist and asserts that it returns -1. It then calls syswait with 0
+(the idle process) and asserts that it returns -1.
+
+To test the success case of syswait, this test creates a process and waits for
+it to terminate. That process calls sysstop, and the test process is unblocked.
+
+***How the Output Demonstrates What is Being Tested***
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running syswait_test
+Finished syswait_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+5. sysopen with invalid arguments
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that passing invalid arguments to sysopen returns with the
+correct values.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for devices, which can
+be found at devicetest.c.
+
+#define SYSERR -1
+
+static void sysopen_sysclose_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    int fd;
+    int fd2;
+
+    if (debug) sysputs("Failure tests: close invalid device...\n");
+    assert_equal(sysclose(-1), SYSERR);
+    assert_equal(sysclose(2), SYSERR);
+
+    if (debug) sysputs("Failure tests: open invalid devices...\n");
+    fd = sysopen(-1);
+    assert_equal(fd, SYSERR);
+    fd = sysopen(40);
+    assert_equal(fd, SYSERR);
+
+    if (debug) sysputs("Open then close a keyboard...\n");
+    fd = sysopen(KBD_1);
+    assert_equal(fd, 0);
+    assert_equal(sysclose(fd), 0);
+
+    if (debug) sysputs("Failure tests: close a keyboard device twice...\n");
+    assert_equal(sysclose(fd), SYSERR);
+
+    if (debug) sysputs("Failure tests: Open the same keyboard twice then
+    close...\n");
+    fd = sysopen(KBD_1);
+    fd2 = sysopen(KBD_1);
+    assert_equal(fd, 0);
+    assert_equal(fd2, SYSERR);
+    assert_equal(sysclose(fd), 0);
+    assert_equal(sysclose(fd2), SYSERR);
+
+    fd = sysopen(KBD_0);
+    fd2 = sysopen(KBD_0);
+    assert_equal(fd, 0);
+    assert_equal(fd2, SYSERR);
+    assert_equal(sysclose(fd), 0);
+    assert_equal(sysclose(fd2), SYSERR);
+
+    if (debug) sysputs("Failure tests: open two different keyboard devices then
+    close...\n");
+    fd = sysopen(KBD_1);
+    fd2 = sysopen(KBD_0);
+    assert_equal(fd, 0);
+    assert_equal(fd2, SYSERR);
+    assert_equal(sysclose(fd), 0);
+    assert_equal(sysclose(fd2), SYSERR);
+
+    fd = sysopen(KBD_0);
+    fd2 = sysopen(KBD_1);
+    assert_equal(fd, 0);
+    assert_equal(fd2, SYSERR);
+    assert_equal(sysclose(fd), 0);
+    assert_equal(sysclose(fd2), SYSERR);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+To test passing invalid arguments to sysopen, this test validates that passing
+invalid major device numbers returns -1. It then validates that opening the
+same keyboard twice will return -1 on the second sysopen, for both versions of
+the keyboard. It then checks that only one keyboard device can be open at a
+time, either the echo or no-echo version.
+
+***How the Output Demonstrates What is Being Tested***
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running sysopen_sysclose_test
+Failure tests: close invalid device...
+Failure tests: open invalid devices...
+Open then close a keyboard...
+Failure tests: close a keyboard device twice...
+Failure tests: Open the same keyboard twice then close...
+Failure tests: open two different keyboard devices then close...
+Finished sysopen_sysclose_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+6. syswrite with invalid file descriptor
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that passing an invalid file descriptor to syswrite returns
+with the correct value.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for devices, which can
+be found at devicetest.c.
+
+static void syswrite_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    int fd;
+    char buf[20];
+    sprintf(buf, "cs415");
+
+    if (debug) sysputs("Write to opened device...\n");
+    fd = sysopen(KBD_1);
+    assert_equal(fd, 0);
+    // syswrite is not supported by the keyboard device
+    assert_equal(syswrite(fd, buf, strlen(buf)), -1);
+
+    if (debug) sysputs("Write to closed device...\n");
+    assert_equal(sysclose(fd), 0);
+    assert_equal(syswrite(fd, buf, strlen(buf)), SYSERR);
+
+    if (debug) sysputs("Write to invalid FD...\n");
+    assert_equal(syswrite(-1, buf, strlen(buf)), SYSERR);
+    assert_equal(syswrite(2, buf, strlen(buf)), SYSERR);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+This test opens the echo version of the keyboard and asserts that the file
+descriptor is 0 (a valid file descriptor). It then closes the file descriptor
+with sysclose, and passes it to syswrite, asserting that -1 is returned. It
+then asserts that passing invalid file descriptors (invalid range, never opened)
+returns -1.
+
+***How the Output Demonstrates What is Being Tested***
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running syswrite_test
+Write to opened device...
+Write to closed device...
+Write to invalid FD...
+Finished syswrite_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+7. sysioctl test for invalid commands
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that passing invalid commands to sysioctl return with the
+correct value.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for devices, which can
+be found at devicetest.c.
+
+static void sysioctl_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    int fd;
+    fd = sysopen(KBD_1);
+
+    if (debug) sysputs("IOCTL on a valid FD...\n");
+    assert_equal(sysioctl(fd, IOCTL_CHANGE_EOF, 'a'), 0);
+    assert_equal(sysioctl(fd, IOCTL_ECHO_OFF), 0);
+    assert_equal(sysioctl(fd, IOCTL_ECHO_ON), 0);
+
+    if (debug) sysputs("Failure tests: IOCTL with invalid command code...\n");
+    assert_equal(sysioctl(fd, 1), SYSERR);
+    assert_equal(sysioctl(fd, -1), SYSERR);
+    assert_equal(sysioctl(fd, 0), SYSERR);
+
+    if (debug) sysputs("Failure tests: IOCTL with NULL command
+    parameters...\n");
+    assert_equal(sysioctl(fd, IOCTL_CHANGE_EOF, NULL), -1);
+    assert_equal(sysioctl(fd, IOCTL_CHANGE_EOF, NULL, NULL), -1);
+
+    if (debug) sysputs("Failure tests: IOCTL with closed FD...\n");
+    assert_equal(sysclose(fd), 0);
+    assert_equal(sysioctl(fd, IOCTL_CHANGE_EOF, 'a'), SYSERR);
+    assert_equal(sysioctl(fd, IOCTL_ECHO_OFF), SYSERR);
+    assert_equal(sysioctl(fd, IOCTL_ECHO_ON), SYSERR);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+This test opens the echo version of the keyboard, and then validates that
+passing invalid commands (1, -1, and 0) to sysioctl returns with -1. It also
+checks that passing command 53 (change EOF) to sysioctl with invalid additional
+arguments returns 0. The test then validates that calling sysioctl with a closed
+file descriptor returns -1.
+
+***How the Output Demonstrates What is Being Tested***
+
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running sysioctl_test
+IOCTL on a valid FD...
+Failure tests: IOCTL with invalid command code...
+Failure tests: IOCTL with NULL command parameters...
+Failure tests: IOCTL with closed FD...
+Finished sysioctl_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+8. sysread when there are more characters buffered in kernel than the read
+   requests
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that the kernel can handle the case when there are more
+characters buffered in the kernel buffer than the read requests.
+
+***How the Test is Structured***
+This is a partially automated test that is part of the test suite for devices,
+which can be found at devicetest.c.
+
+static void sysread_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    int fd;
+    char buf[20] = {'\0'};
+
+    fd = sysopen(KBD_1);
+    sysputs("Please type on the keyboard...\n");
+
+    // Reset read buffer
+    memset(buf, '\0', sizeof(buf));
+    sysputs("Fill up kernel buffer\n");
+    busy_wait();
+
+    int bytes = sysread(fd, buf, 1);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 2);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 4);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 8);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 16);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    sysclose(fd);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+This test opens the echo version of the keyboard and calls sysread,
+requesting 1, 2, 4, 8, and then 16 bytes. This input for this test is manual,
+which allows it to be used to test many scenarios.
+
+***How the Output Demonstrates What is Being Tested***
+
+An example output is:
+
+Running sysread_test
+Please type on the keyboard...
+Fill up kernel buffer
+Busy wait...
+asdfasdfasdfasdfasdf
+Bytes read = 1, typed characters = a
+
+Bytes read = 2, typed characters = sd
+cat
+Bytes read = 4, typed characters = fcat
+asdfasdfasdfasdf
+Bytes read = 16, typed characters = asdfasdfasdfasdf
+Finished sysread_test
+Busy wait...
+
+Note that we fill up the kernel buffer when busy_wait is called. In this case,
+the kernel buffers the first 4 characters and uses them to service the read
+requests before more keyboard input is necessary to service them.
+
+9.  Blocked processes unblocked by a signal return with the correct value
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that processes blocked on a system call that are unblocked
+by a signal return with the correct value.
+
+***How the Test is Structured***
+This is an automated test that is part of the test suite for signal.c, which can
+be found at signaltest.c. Note that this test suite assumes that pre-emption is
+disabled.
+
+#define LOW_PRI_SIGNAL 1
+
+/*------------------------------------------------------------------------------
+ * Tests return value of system call when a signal is targeted at blocked
+ * process.
+ *------------------------------------------------------------------------------
+ */
+static void signal_blocked_process_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    PID_t pid = syscreate(&blocked_process, PROCESS_STACK_SIZE);
+    g_sender_pid = sysgetpid();
+
+    for (int i = 0; i < 4; i++) {
+        sysyield();
+        if (debug) kprintf("Sending signal %d\n", LOW_PRI_SIGNAL);
+        int res = syskill(pid, LOW_PRI_SIGNAL);
+        assert_equal(res, 0);
+    }
+    // Ensure that blocked_process is unblocked from the 4th system call
+    sysyield();
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+/*------------------------------------------------------------------------------
+ * Helper process in signal_blocked_process_test.
+ *------------------------------------------------------------------------------
+ */
+static void blocked_process(void) {
+    if (debug) kprintf("%s starts\n", __func__);
+
+    unsigned int target_pid = g_sender_pid;
+    unsigned int receive_any_pid = 0;
+    unsigned int num = 0;
+    signal_handler_funcptr oldHandler = NULL;
+    // This process must have a signal handler for the signal being sent by
+    // syskill, otherwise, the signal will be ignored and the blocking system
+    // calls will remain blocked
+    syssighandler(LOW_PRI_SIGNAL, &low_pri_sighandler, &oldHandler);
+
+    assert_equal(syswait(target_pid), ERR_UNBLOCKED_ON_SIGNAL);
+    // Test return values of send, receive, and receive-any
+    assert_equal(syssend(target_pid, num), ERR_UNBLOCKED_ON_SIGNAL);
+    assert_equal(sysrecv(&target_pid, &num), ERR_UNBLOCKED_ON_SIGNAL);
+    assert_equal(sysrecv(&receive_any_pid, &num), ERR_UNBLOCKED_ON_SIGNAL);
+
+    if (debug) kprintf("%s terminates\n", __func__);
+}
+
+/*------------------------------------------------------------------------------
+ * A low priority signal handler.
+ *------------------------------------------------------------------------------
+ */
+static void low_pri_sighandler(void *arg) {
+    kprintf("Signal %d handler starts\n", LOW_PRI_SIGNAL);
+    g_signal_fired = LOW_PRI_SIGNAL;
+    assert(g_signal_fired == LOW_PRI_SIGNAL, "low_pri_sighandler");
+}
+
+This test creates a process (blocked_process) and sets g_sender_pid to its own
+PID. It then yields to the process, which registers a signal handler for signal
+1. It then calls syswait on the test process. The test process then sends signal
+1 to blocked_process, which interrupts the syswait call. blocked_process then
+asserts that the return value of the syswait call is -666 as expected. The same
+expected behaviour is tested for other blocking system calls such as syssend,
+sysrecv (targeted), and receive-any.
+
+***How the Output Demonstrates What is Being Tested***
+
+On a successful run of this test with debug printing enabled, there is little
+output.
+
+Running signal_blocked_process_test
+blocked_process starts
+Sending signal 1
+Signal 1 handler starts
+Sending signal 1
+Signal 1 handler starts
+Sending signal 1
+Signal 1 handler starts
+Sending signal 1
+Signal 1 handler starts
+blocked_process terminates
+Finished signal_blocked_process_test
+
+If the test fails, ie. an assertion fails, then there would be output
+corresponding to the assertion failure, and the kernel would be paused.
+
+
+10. Return value of sysread is number of bytes read
+--------------------------------------------------------------------------------
+***What is Being Tested***
+This test validates that sysread returns the correct number of bytes read.
+
+***How the Test is Structured***
+This is a partially automated test that is part of the test suite for devices,
+which can be found at devicetest.c.
+
+static void sysread_test(void) {
+    if (debug) kprintf("Running %s\n", __func__);
+
+    int fd;
+    char buf[20] = {'\0'};
+
+    fd = sysopen(KBD_1);
+    sysputs("Please type on the keyboard...\n");
+
+    // Reset read buffer
+    memset(buf, '\0', sizeof(buf));
+    sysputs("Fill up kernel buffer\n");
+    busy_wait();
+
+    int bytes = sysread(fd, buf, 1);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 2);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 4);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 8);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    memset(buf, '\0', sizeof(buf));
+    bytes = sysread(fd, buf, 16);
+    kprintf("\nBytes read = %d, typed characters = %s\n", bytes, buf);
+
+    sysclose(fd);
+
+    if (debug) kprintf("Finished %s\n", __func__);
+}
+
+This test opens the echo version of the keyboard and calls sysread,
+requesting 1, 2, 4, 8, and then 16 bytes. This input for this test is manual,
+which allows it to be used to test many scenarios.
+
+***How the Output Demonstrates What is Being Tested***
+An example run of this test is:
+
+Running sysread_test
+Please type on the keyboard...
+a
+Bytes read = 1, typed characters = a
+ab
+Bytes read = 2, typed characters = ab
+asdf
+Bytes read = 4, typed characters = asdf
+asdfasdf
+Bytes read = 8, typed characters = asdf
+asdfasdfasdfasdf
+Bytes read = 16, typed characters = asdfasdfasdfasdf
+Finished sysread_test
+
+In this run, EOF or enter is never pressed.
+
+A run where EOF is pressed is:
+
+Running sysread_test
+Please type on the keyboard...
+a
+Bytes read = 1, typed characters = a
+aEOF
+Bytes read = 1, typed characters = a
+
+Bytes read = 0, typed characters =
+
+Bytes read = 0, typed characters =
+
+Bytes read = 0, typed characters =
+Finished sysread_test
+
+This verifies that EOF can be handled and read is successfully unblocked
+on encountering an EOF.
